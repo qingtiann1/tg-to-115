@@ -910,70 +910,83 @@ async def handle_download(client: Client, link: str) -> str:
         if not fresh:
             return "❌ 消息不存在或无法访问"
 
-        # 检查是否是相册(media_group): 找到组内视频(优先最长)
+        # 收集所有媒体(单条或相册)，按消息ID排序
         media_group_id = getattr(fresh, "media_group_id", None)
-        download_target = fresh
+        all_media = []
+
         if media_group_id:
-            log.info(f"[DL] Media group detected, searching for video...")
-            # 搜索±30范围内的同组消息
-            group_msgs = []
+            # 相册: 搜索±30范围内的同组消息
+            seen_ids = set()
             try:
                 async for m in client.get_chat_history(src.id, limit=60, offset_id=msg_id+30):
                     if getattr(m, "media_group_id", None) == media_group_id:
-                        group_msgs.append(m)
+                        if m.id not in seen_ids:
+                            seen_ids.add(m.id)
+                            all_media.append(m)
                 async for m in client.get_chat_history(src.id, limit=60, offset_id=msg_id-30):
                     if getattr(m, "media_group_id", None) == media_group_id:
-                        group_msgs.append(m)
+                        if m.id not in seen_ids:
+                            seen_ids.add(m.id)
+                            all_media.append(m)
             except Exception:
                 pass
-
-            # 找组内视频(优先最长)
-            videos = [m for m in group_msgs if m.video and getattr(m.video, "duration", 0)]
-            if videos:
-                videos.sort(key=lambda m: m.video.duration, reverse=True)
-                download_target = videos[0]
-                log.info(f"[DL] Found video in album: {videos[0].id} ({videos[0].video.duration}s)")
-
-        # 下载视频
-        tmp = tmp_mod.mktemp(suffix=".mp4", dir=TEMP_DIR)
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        await client.download_media(download_target, file_name=tmp)
-        fsize = os.path.getsize(tmp)
-        caption = clean_caption(download_target.caption or fresh.caption or "")
-
-        log.info(f"[DL] Downloaded: {fsize/1048576:.1f}MB")
-
-        # 上传115
-        p115_msg = ""
-        if check_115_ready():
-            src_title = safe_filename(src.title or str(src.id), max_len=30)
-            now = fresh.date or datetime.now()
-            remote_dir = f"{P115_TARGET_DIR}/{src_title}/{now.year}-{now.month:02d}"
-            safe_name = safe_filename(caption) if caption else f"video_{msg_id}"
-            if upload_to_115(tmp, remote_dir, f"{safe_name}.mp4"):
-                p115_msg = "\n☁️ 115: 已上传"
-            else:
-                p115_msg = "\n⚠️ 115: 上传失败"
+            all_media.sort(key=lambda m: m.id)
+            log.info(f"[DL] Album: {len(all_media)} media items")
         else:
-            p115_msg = "\n⚠️ 115: Cookie未配置"
+            # 单条消息
+            all_media = [fresh]
 
-        # 可选: 转发到目标群 (不重复发，用户可能已经转过了)
-        if not media_group_id and DEST_GROUP != 0:
+        # 过滤有效媒体(图或视频)
+        media_items = [m for m in all_media if m.photo or m.video or (m.document and "video" in (getattr(m.document, "mime_type", "") or "")) or (m.document and "image" in (getattr(m.document, "mime_type", "") or ""))]
+        if not media_items:
+            return "❌ 消息中没有图片或视频"
+
+        # 标题: 用第一条有标题的消息
+        caption = ""
+        for m in all_media:
+            if m.caption:
+                caption = clean_caption(m.caption)
+                break
+        if not caption and fresh.caption:
+            caption = clean_caption(fresh.caption)
+
+        # 下载和上传所有媒体
+        p115_ok = check_115_ready()
+        src_title = safe_filename(src.title or str(src.id), max_len=30)
+        now = fresh.date or datetime.now()
+        remote_dir = f"{P115_TARGET_DIR}/{src_title}/{now.year}-{now.month:02d}"
+        os.makedirs(TEMP_DIR, exist_ok=True)
+
+        results = []
+        for i, m in enumerate(media_items):
+            num = i + 1
+            base = caption if caption else "media"
+            title = f"{base} {num}" if len(media_items) > 1 else base
+            ext = ".jpg" if m.photo else ".mp4"
+            tmp = tmp_mod.mktemp(suffix=ext, dir=TEMP_DIR)
+
             try:
-                if download_target.video:
-                    v = download_target.video
-                    await client.send_video(DEST_GROUP, tmp, caption=caption,
-                                            width=v.width, height=v.height,
-                                            duration=int(v.duration or 0))
-                elif download_target.photo:
-                    await client.send_photo(DEST_GROUP, tmp, caption=caption)
-                else:
-                    await client.send_document(DEST_GROUP, tmp, caption=caption)
-            except Exception as e:
-                log.warning(f"[DL] Forward failed: {e}")
+                await client.download_media(m, file_name=tmp)
+                fsize = os.path.getsize(tmp)
+                label = "📷" if m.photo else "📹"
+                results.append(f"{label} {title} ({fsize/1048576:.1f}MB)")
 
-        os.remove(tmp)
-        return f"✅ 下载完成\n📹 {caption[:60] if caption else '(无标题)'}\n📦 {fsize/1048576:.1f}MB{p115_msg}"
+                # 上传115
+                if p115_ok:
+                    safe_name = safe_filename(title)
+                    if upload_to_115(tmp, remote_dir, f"{safe_name}{ext}"):
+                        results[-1] += " ☁️"
+                    else:
+                        results[-1] += " ⚠️"
+            except Exception as e:
+                results.append(f"❌ #{num}: {str(e)[:60]}")
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+
+        total = len(media_items)
+        p115_status = "☁️ 115: 已上传" if p115_ok else "\n⚠️ 115: Cookie未配置"
+        return f"✅ 下载完成 ({total}个文件)\n" + "\n".join(results) + f"\n📂 {remote_dir}{p115_status}"
 
     except Exception as e:
         log.error(f"[DL] Error: {e}")
