@@ -1056,6 +1056,15 @@ async def mirror_destination(client: Client):
 
                 if upload_to_115(tmp, remote_dir, filename):
                     log.info(f"[Mirror] msg {msg.id} -> 115 OK ({fsize/1048576:.1f}MB)")
+                    # 通知用户
+                    try:
+                        cap_preview = (caption[:50] + "...") if len(caption) > 50 else caption
+                        await client.send_message(
+                            NOTIFY_CHAT,
+                            f"☁️ 已上传115\n📹 {cap_preview if cap_preview else '(无标题)'}\n📦 {fsize/1048576:.1f}MB\n📂 {remote_dir}"
+                        )
+                    except Exception:
+                        pass
 
                 last_id = msg.id
                 with open(mirror_pf, "w") as f:
