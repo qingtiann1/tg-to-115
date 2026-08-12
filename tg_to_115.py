@@ -640,6 +640,256 @@ async def notify_daily_summary(client: Client):
 
 
 # ============================================================
+# 内置命令系统 (发消息到 Saved Messages 即可管理)
+# ============================================================
+
+_CMD_LAST_ID = 0  # 上次处理的命令消息 ID
+_CMD_ID_FILE = os.path.join(CONFIG_DIR, "cmd_last_id.txt")
+
+
+def load_cmd_last_id() -> int:
+    try:
+        with open(_CMD_ID_FILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+
+def save_cmd_last_id(msg_id: int):
+    with open(_CMD_ID_FILE, "w") as f:
+        f.write(str(msg_id))
+
+
+async def check_commands(client: Client):
+    """检查 Saved Messages 中的命令并执行"""
+    global _CMD_LAST_ID
+    if _CMD_LAST_ID == 0:
+        _CMD_LAST_ID = load_cmd_last_id()
+
+    try:
+        cmd_msgs = []
+        async for msg in client.get_chat_history(NOTIFY_CHAT, limit=10):
+            if msg.id <= _CMD_LAST_ID:
+                break
+            if msg.text:
+                cmd_msgs.append(msg)
+
+        if not cmd_msgs:
+            return
+
+        for msg in reversed(cmd_msgs):
+            text = msg.text.strip()
+            reply = await handle_command(client, text)
+
+            if reply:
+                try:
+                    await client.send_message(NOTIFY_CHAT, reply)
+                except Exception as e:
+                    log.warning(f"Command reply failed: {e}")
+
+            _CMD_LAST_ID = msg.id
+            save_cmd_last_id(msg.id)
+
+    except Exception as e:
+        log.warning(f"Command check error: {e}")
+
+
+async def handle_command(client: Client, text: str) -> str | None:
+    """解析并执行命令。返回回复文本，若无匹配返回 None"""
+    sources = load_sources()
+    changed = False
+
+    # --- /115 cookies 设置 ---
+    if text.startswith("/115"):
+        cookie_text = text[4:].strip()
+        if not cookie_text:
+            return (
+                "📋 <b>设置115 Cookie</b>\n\n"
+                "请发送: <code>/115 UID=xxx; CID=xxx; SEID=xxx; KID=xxx</code>\n\n"
+                "从浏览器获取: 登录 115.com → F12 → Application → Cookies → 复制四个值"
+            )
+        try:
+            with open(P115_COOKIE_FILE, "w") as f:
+                f.write(cookie_text + "\n")
+            log.info("115 cookies saved via command")
+            return "✅ 115 Cookie 已保存! 下次 upload 任务将自动上传到115网盘。"
+        except Exception as e:
+            return f"❌ 保存失败: {e}"
+
+    # --- /add 添加源群 ---
+    if text.startswith("/add"):
+        args = text[5:].strip().split()
+        if not args:
+            return (
+                "📋 <b>添加源群</b>\n\n"
+                "<code>/add @username</code> — 添加公开群 (forward模式)\n"
+                "<code>/add @username upload</code> — 添加并上传115\n"
+                "<code>/add -100123456 群名</code> — 添加私密群 (ID模式)\n"
+                "<code>/add @username once</code> — 一次性转存"
+            )
+        source = args[0]
+        method = "forward"
+        mode = "watch"
+        name = None
+
+        for a in args[1:]:
+            if a == "upload":
+                method = "upload"
+            elif a == "forward":
+                method = "forward"
+            elif a == "once":
+                mode = "once"
+            elif a == "watch":
+                mode = "watch"
+            elif not a.startswith("-"):
+                name = a
+
+        # 解析 source: @username 或 -100数字ID
+        if source.startswith("@"):
+            source = source[1:]  # 去掉 @
+        elif source.startswith("-100"):
+            pass  # 直接用作 ID
+        else:
+            return f"❌ 无法识别的群组标识: {source}\n请使用 @username 或 -100 开头的数字ID"
+
+        if not name:
+            name = "bot_" + source.replace("/", "_")[:30]
+
+        # 检查重复
+        for s in sources:
+            if s["name"] == name:
+                return f"⚠️ <b>{name}</b> 已存在"
+
+        sources.append({
+            "name": name,
+            "source": source,
+            "method": method,
+            "enabled": True,
+            "mode": mode,
+            "skip_photos": method == "upload",
+            "min_video_mb": 5,
+            "upload_to_115": method == "upload",
+            "batch_size": 10,
+            "batch_delay": 10,
+            "single_delay": 8,
+            "extra_skip_words": [],
+        })
+        changed = True
+
+        m115 = "☁️上传115" if method == "upload" else "📤仅转发"
+        m_mode = "👁️持续监控" if mode == "watch" else "📦一次性"
+        return f"✅ 已添加: <b>{name}</b>\n源: <code>{source}</code>\n模式: {m_mode} | {m115}"
+
+    # --- /list 列表 ---
+    if text.startswith("/list"):
+        if not sources:
+            return "📋 暂无源群。用 /add 添加。"
+        lines = ["<b>📋 源群列表</b>\n"]
+        for s in sources:
+            icon = "🟢" if s.get("enabled") else "🔴"
+            done = " ✅" if s.get("complete") else ""
+            m = "⬆️upload" if s.get("method") == "upload" else "📤fwd"
+            prog = load_progress(s["name"])
+            lines.append(
+                f"{icon} <b>{s['name']}</b> [{m}] done={prog.get('done',0)}{done}"
+            )
+        return "\n".join(lines)
+
+    # --- /rm 删除 ---
+    if text.startswith("/rm"):
+        name = text[4:].strip()
+        if not name:
+            return "用法: <code>/rm 群组名</code>"
+        new_sources = [s for s in sources if s["name"] != name]
+        if len(new_sources) == len(sources):
+            return f"❌ 未找到: <b>{name}</b>"
+        sources[:] = new_sources
+        changed = True
+        # 删除进度文件
+        pf = progress_file(name)
+        if os.path.exists(pf):
+            os.remove(pf)
+        return f"🗑️ 已删除: <b>{name}</b>"
+
+    # --- /on 启用 ---
+    if text.startswith("/on"):
+        name = text[4:].strip()
+        for s in sources:
+            if s["name"] == name:
+                s["enabled"] = True
+                s["complete"] = False
+                changed = True
+                return f"🟢 已启用: <b>{name}</b>"
+        return f"❌ 未找到: <b>{name}</b>"
+
+    # --- /off 禁用 ---
+    if text.startswith("/off"):
+        name = text[5:].strip()
+        for s in sources:
+            if s["name"] == name:
+                s["enabled"] = False
+                changed = True
+                return f"🔴 已禁用: <b>{name}</b>"
+        return f"❌ 未找到: <b>{name}</b>"
+
+    # --- /method 改模式 ---
+    if text.startswith("/method"):
+        parts = text[8:].strip().split()
+        if len(parts) < 2:
+            return "用法: <code>/method 群组名 forward|upload</code>"
+        name, method = parts[0], parts[1]
+        if method not in ("forward", "upload"):
+            return f"❌ 无效模式: {method} (应为 forward 或 upload)"
+        for s in sources:
+            if s["name"] == name:
+                s["method"] = method
+                s["upload_to_115"] = method == "upload"
+                s["skip_photos"] = method == "upload"
+                changed = True
+                return f"✅ <b>{name}</b> 模式已改为: {method}"
+        return f"❌ 未找到: <b>{name}</b>"
+
+    # --- /status 状态 ---
+    if text.startswith("/status"):
+        enabled = [s for s in sources if s.get("enabled")]
+        lines = [
+            "<b>📊 系统状态</b>\n",
+            f"目标群: <code>{DEST_GROUP}</code>",
+            f"115 Cookie: {'✅' if os.path.exists(P115_COOKIE_FILE) else '❌ 未配置'}",
+            f"源群: {len(sources)} 个 ({len(enabled)} 启用)",
+            f"扫描间隔: {CHECK_INTERVAL}s",
+        ]
+        for s in enabled:
+            prog = load_progress(s["name"])
+            lines.append(
+                f"  🟢 {s['name']}: {s['method']} done={prog.get('done',0)} "
+                f"last_id={prog.get('last_id',0)}"
+            )
+        return "\n".join(lines)
+
+    # --- /help ---
+    if text.startswith("/help"):
+        return (
+            "<b>📡 tg-to-115 命令</b>\n\n"
+            "<code>/115 UID=xxx; CID=xxx; ...</code> — 设置115 Cookie\n"
+            "<code>/add @群组 [upload] [once]</code> — 添加源群\n"
+            "<code>/list</code> — 查看所有源群\n"
+            "<code>/rm 群组名</code> — 删除源群\n"
+            "<code>/on 群组名</code> — 启用\n"
+            "<code>/off 群组名</code> — 禁用\n"
+            "<code>/method 群组名 forward|upload</code> — 改模式\n"
+            "<code>/status</code> — 系统状态\n"
+            "<code>/help</code> — 帮助"
+        )
+
+    # 保存更改
+    if changed:
+        save_sources(sources)
+
+    return None  # 非命令消息，不回复
+
+
+# ============================================================
 # 主循环
 # ============================================================
 
@@ -796,6 +1046,9 @@ async def main():
         write_heartbeat()
 
         try:
+            # 先检查用户命令
+            await check_commands(client)
+
             sources = load_sources()
 
             if not sources:
