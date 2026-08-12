@@ -1,0 +1,15 @@
+services:
+  tg-to-115:
+    image: qingtiann1/tg-to-115:latest
+    container_name: tg-to-115
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./config:/app/config        # session + sources.json + 115-cookies.txt + progress
+      - ./downloads:/app/downloads   # 可选: 下载文件持久化
+    environment:
+      - TZ=Asia/Shanghai
+    # 如果 Telegram 走宿主机代理，取消下面注释:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"

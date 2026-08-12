@@ -1,0 +1,24 @@
+# Environment
+.env
+
+# Sessions
+config/*.session
+config/*.session-journal
+
+# Progress files (runtime state)
+config/*.json
+!config/sources.json
+
+# 115 cookies
+config/115-cookies.txt
+
+# Temp files
+temp/*
+downloads/*
+
+# Python
+__pycache__/
+*.pyc
+
+# Docker
+.env
