@@ -1,6 +1,6 @@
 services:
   tg-to-115:
-    image: qingtiann1/tg-to-115:latest
+    build: .
     container_name: tg-to-115
     restart: unless-stopped
     env_file:
@@ -10,6 +10,7 @@ services:
       - ./downloads:/app/downloads   # 可选: 下载文件持久化
     environment:
       - TZ=Asia/Shanghai
-    # 如果 Telegram 走宿主机代理，取消下面注释:
+    # 如果 Telegram 需要走宿主代理，修改 .env 中的 TG_PROXY 即可
+    # 容器内使用 host.docker.internal 访问宿主机端口:
     # extra_hosts:
     #   - "host.docker.internal:host-gateway"
