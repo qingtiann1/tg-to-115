@@ -760,6 +760,18 @@ async def main():
             json.dump(default_sources, f, ensure_ascii=False, indent=2)
         log.info(f"Created default sources.json")
 
+    # 修复 session 数据库 (从旧容器复制时可能有 WAL 锁)
+    _session_file = os.path.join(CONFIG_DIR, f"{SESSION_NAME}.session")
+    if os.path.exists(_session_file):
+        try:
+            import sqlite3
+            _conn = sqlite3.connect(_session_file)
+            _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            _conn.close()
+            log.info("Session database checkpointed")
+        except Exception as _e:
+            log.warning(f"Session checkpoint failed (non-fatal): {_e}")
+
     # 构建 Pyrogram client
     proxy = parse_proxy(PROXY_URL)
     session_path = os.path.join(CONFIG_DIR, SESSION_NAME)
