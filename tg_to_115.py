@@ -688,10 +688,17 @@ async def check_commands(client: Client):
             reply = await handle_command(client, text)
 
             if reply:
-                try:
-                    await client.send_message(NOTIFY_CHAT, reply)
-                except Exception as e:
-                    log.warning(f"Command reply failed: {e}")
+                # 检查是否是异步任务 (下载上传)
+                if isinstance(reply, tuple) and reply[0] == "__dl__":
+                    link = reply[1]
+                    await client.send_message(NOTIFY_CHAT, f"⏳ 正在处理: <code>{link}</code>")
+                    result = await handle_download(client, link)
+                    await client.send_message(NOTIFY_CHAT, result)
+                else:
+                    try:
+                        await client.send_message(NOTIFY_CHAT, reply)
+                    except Exception as e:
+                        log.warning(f"Command reply failed: {e}")
 
             _CMD_LAST_ID = msg.id
             save_cmd_last_id(msg.id)
@@ -879,6 +886,7 @@ async def handle_command(client: Client, text: str) -> str | None:
             "<b>📡 tg-to-115 命令</b>\n\n"
             "<code>/115 UID=xxx; CID=xxx; ...</code> — 设置115 Cookie\n"
             "<code>/add @群组 [upload] [once]</code> — 添加源群\n"
+            "<code>/dl https://t.me/xxx/12345</code> — 下载单条视频→上传115\n"
             "<code>/list</code> — 查看所有源群\n"
             "<code>/rm 群组名</code> — 删除源群\n"
             "<code>/on 群组名</code> — 启用\n"
@@ -888,11 +896,87 @@ async def handle_command(client: Client, text: str) -> str | None:
             "<code>/help</code> — 帮助"
         )
 
+    # --- /dl 单条下载 ---
+    if text.startswith("/dl"):
+        return ("__dl__", text[4:].strip())
+
     # 保存更改
     if changed:
         save_sources(sources)
 
     return None  # 非命令消息，不回复
+
+
+async def handle_download(client: Client, link: str) -> str:
+    """处理 /dl 命令: 下载单条视频 → 115 → TGdown"""
+    import tempfile as tmp_mod
+
+    # 解析链接: https://t.me/xxx/12345 或 https://t.me/c/123456789/4205
+    m = re.search(r"(?:https?://)?t(?:elegram)?\.me/(?:c/)?([^/\s]+)/(\d+)", link)
+    if not m:
+        return "❌ 无法解析链接。格式: <code>/dl https://t.me/群组名/消息ID</code>"
+
+    chat_raw = m.group(1)
+    msg_id = int(m.group(2))
+    if chat_raw.isdigit() and not chat_raw.startswith("-"):
+        chat_id = int(f"-100{chat_raw}")
+    elif chat_raw.startswith("-100"):
+        chat_id = int(chat_raw)
+    else:
+        chat_id = chat_raw
+
+    log.info(f"[DL] {chat_id}/{msg_id}")
+
+    try:
+        src = await client.get_chat(chat_id)
+        fresh = await client.get_messages(src.id, msg_id)
+        if not fresh:
+            return "❌ 消息不存在或无法访问"
+
+        # 下载
+        tmp = tmp_mod.mktemp(suffix=".mp4", dir=TEMP_DIR)
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        await client.download_media(fresh, file_name=tmp)
+        fsize = os.path.getsize(tmp)
+        caption = clean_caption(fresh.caption or "")
+
+        log.info(f"[DL] Downloaded: {fsize/1048576:.1f}MB")
+
+        # 上传115
+        p115_msg = ""
+        if check_115_ready():
+            src_title = safe_filename(src.title or str(src.id), max_len=30)
+            now = fresh.date or datetime.now()
+            remote_dir = f"{P115_TARGET_DIR}/{src_title}/{now.year}-{now.month:02d}"
+            safe_name = safe_filename(caption) if caption else f"video_{msg_id}"
+            if upload_to_115(tmp, remote_dir, f"{safe_name}.mp4"):
+                p115_msg = "\n☁️ 115: 已上传"
+            else:
+                p115_msg = "\n⚠️ 115: 上传失败"
+        else:
+            p115_msg = "\n⚠️ 115: 未配置 (/115 设置Cookie)"
+
+        # 转发到目标群
+        if DEST_GROUP != 0:
+            try:
+                if fresh.video:
+                    v = fresh.video
+                    await client.send_video(DEST_GROUP, tmp, caption=caption,
+                                            width=v.width, height=v.height,
+                                            duration=int(v.duration or 0))
+                elif fresh.photo:
+                    await client.send_photo(DEST_GROUP, tmp, caption=caption)
+                else:
+                    await client.send_document(DEST_GROUP, tmp, caption=caption)
+            except Exception as e:
+                log.warning(f"[DL] Forward failed: {e}")
+
+        os.remove(tmp)
+        return f"✅ 下载完成\n📹 {caption[:60] if caption else '(无标题)'}\n📦 {fsize/1048576:.1f}MB{p115_msg}"
+
+    except Exception as e:
+        log.error(f"[DL] Error: {e}")
+        return f"❌ 失败: {str(e)[:200]}"
 
 
 # ============================================================
