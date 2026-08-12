@@ -667,8 +667,14 @@ async def check_commands(client: Client):
         _CMD_LAST_ID = load_cmd_last_id()
 
     try:
+        # 解析通知目标 (支持 "me" / 数字ID / @username)
+        notify_peer = NOTIFY_CHAT
+        if notify_peer == "me":
+            me = await client.get_me()
+            notify_peer = me.id
+
         cmd_msgs = []
-        async for msg in client.get_chat_history(NOTIFY_CHAT, limit=10):
+        async for msg in client.get_chat_history(notify_peer, limit=10):
             if msg.id <= _CMD_LAST_ID:
                 break
             if msg.text:
