@@ -171,59 +171,36 @@ def safe_filename(text: str, max_len: int = 80) -> str:
 # ============================================================
 
 def check_115_ready() -> bool:
-    """检查 115 cookie 和 CLI 是否就绪"""
+    """检查 115 cookie 和 p115client 是否就绪"""
     if not os.path.exists(P115_COOKIE_FILE):
-        log.warning(f"115 cookie file not found: {P115_COOKIE_FILE}")
         return False
-    # 检查 115cli 是否可用
     try:
-        r = subprocess.run(["115cli", "--help"], capture_output=True, timeout=5)
-        return r.returncode == 0
-    except FileNotFoundError:
-        log.warning("115cli command not found. Install: pip install p115client")
-        return False
-    except Exception as e:
-        log.warning(f"115cli check failed: {e}")
+        from p115client import P115Client
+        return True
+    except ImportError:
         return False
 
 
 def upload_to_115(filepath: str, remote_dir: str, filename: str) -> bool:
     """
     上传文件到 115 网盘
-    使用 p115client CLI (内置: 秒传 + 大文件分块上传)
-
-    Returns: True if success, False if failed
+    使用 p115client Python API (内置: 秒传 + 大文件分块上传)
     """
     remote_path = f"{remote_dir}/{filename}"
-    log.info(f"  [115] Uploading: {os.path.basename(filepath)} -> {remote_path}")
+    fsize_mb = os.path.getsize(filepath) / 1048576
+    log.info(f"  [115] Uploading: {os.path.basename(filepath)} -> {remote_path} ({fsize_mb:.1f}MB)")
 
     try:
-        # 设置 cookie 文件环境变量 (p115client 默认读 ~/115-cookies.txt)
-        env = os.environ.copy()
-        env["HOME"] = "/root"
+        from p115client import P115Client
+        from pathlib import Path
 
-        result = subprocess.run(
-            ["115cli", "upload", filepath, remote_path],
-            capture_output=True,
-            text=True,
-            timeout=1800,  # 30 min max for large files
-            env=env,
-        )
-
-        if result.returncode == 0:
-            fsize_mb = os.path.getsize(filepath) / 1048576
-            log.info(f"  [115] OK ({fsize_mb:.1f}MB)")
-            return True
-        else:
-            err = result.stderr[:200] if result.stderr else "unknown"
-            log.error(f"  [115] FAIL: {err}")
-            return False
-
-    except subprocess.TimeoutExpired:
-        log.error(f"  [115] TIMEOUT (30min)")
-        return False
+        client = P115Client(Path(P115_COOKIE_FILE))
+        # p115client 的 upload_file 自动处理秒传和分块上传
+        result = client.upload_file(filepath, remote_path)
+        log.info(f"  [115] OK ({fsize_mb:.1f}MB)")
+        return True
     except Exception as e:
-        log.error(f"  [115] ERROR: {e}")
+        log.error(f"  [115] FAIL: {e}")
         return False
 
 
@@ -933,12 +910,36 @@ async def handle_download(client: Client, link: str) -> str:
         if not fresh:
             return "❌ 消息不存在或无法访问"
 
-        # 下载
+        # 检查是否是相册(media_group): 找到组内视频(优先最长)
+        media_group_id = getattr(fresh, "media_group_id", None)
+        download_target = fresh
+        if media_group_id:
+            log.info(f"[DL] Media group detected, searching for video...")
+            # 搜索±30范围内的同组消息
+            group_msgs = []
+            try:
+                async for m in client.get_chat_history(src.id, limit=60, offset_id=msg_id+30):
+                    if getattr(m, "media_group_id", None) == media_group_id:
+                        group_msgs.append(m)
+                async for m in client.get_chat_history(src.id, limit=60, offset_id=msg_id-30):
+                    if getattr(m, "media_group_id", None) == media_group_id:
+                        group_msgs.append(m)
+            except Exception:
+                pass
+
+            # 找组内视频(优先最长)
+            videos = [m for m in group_msgs if m.video and getattr(m.video, "duration", 0)]
+            if videos:
+                videos.sort(key=lambda m: m.video.duration, reverse=True)
+                download_target = videos[0]
+                log.info(f"[DL] Found video in album: {videos[0].id} ({videos[0].video.duration}s)")
+
+        # 下载视频
         tmp = tmp_mod.mktemp(suffix=".mp4", dir=TEMP_DIR)
         os.makedirs(TEMP_DIR, exist_ok=True)
-        await client.download_media(fresh, file_name=tmp)
+        await client.download_media(download_target, file_name=tmp)
         fsize = os.path.getsize(tmp)
-        caption = clean_caption(fresh.caption or "")
+        caption = clean_caption(download_target.caption or fresh.caption or "")
 
         log.info(f"[DL] Downloaded: {fsize/1048576:.1f}MB")
 
@@ -954,17 +955,17 @@ async def handle_download(client: Client, link: str) -> str:
             else:
                 p115_msg = "\n⚠️ 115: 上传失败"
         else:
-            p115_msg = "\n⚠️ 115: 未配置 (/115 设置Cookie)"
+            p115_msg = "\n⚠️ 115: Cookie未配置"
 
-        # 转发到目标群
-        if DEST_GROUP != 0:
+        # 可选: 转发到目标群 (不重复发，用户可能已经转过了)
+        if not media_group_id and DEST_GROUP != 0:
             try:
-                if fresh.video:
-                    v = fresh.video
+                if download_target.video:
+                    v = download_target.video
                     await client.send_video(DEST_GROUP, tmp, caption=caption,
                                             width=v.width, height=v.height,
                                             duration=int(v.duration or 0))
-                elif fresh.photo:
+                elif download_target.photo:
                     await client.send_photo(DEST_GROUP, tmp, caption=caption)
                 else:
                     await client.send_document(DEST_GROUP, tmp, caption=caption)
