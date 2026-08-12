@@ -986,6 +986,92 @@ async def handle_download(client: Client, link: str) -> str:
 _last_summary_date = ""
 
 
+async def mirror_destination(client: Client):
+    """
+    监控目标群(TGdown)的新消息: 下载媒体 → 上传115
+    用户只需转发视频到TGdown，系统自动处理
+    """
+    if DEST_GROUP == 0:
+        return
+
+    # 进度文件
+    mirror_pf = os.path.join(CONFIG_DIR, "progress_mirror.json")
+    last_id = 0
+    if os.path.exists(mirror_pf):
+        try:
+            with open(mirror_pf) as f:
+                last_id = json.load(f).get("last_id", 0)
+        except Exception:
+            pass
+
+    try:
+        new_msgs = []
+        async for msg in client.get_chat_history(DEST_GROUP, limit=20):
+            if msg.id <= last_id:
+                break
+            # 跳过非媒体、自己的消息、旧消息
+            if not msg.video and not msg.photo and not msg.document:
+                continue
+            if msg.from_user and msg.from_user.is_self:
+                continue
+            new_msgs.append(msg)
+
+        if not new_msgs:
+            return
+
+        # 检查115
+        p115_ok = check_115_ready()
+        if not p115_ok:
+            # 只保存进度，不上传
+            max_id = max(m.id for m in new_msgs)
+            with open(mirror_pf, "w") as f:
+                json.dump({"last_id": max_id}, f)
+            return
+
+        # 从新到旧处理 (先处理最新的)
+        for msg in reversed(new_msgs):
+            log.info(f"[Mirror] Processing msg {msg.id}")
+            tmp = os.path.join(TEMP_DIR, f"mirror_{msg.id}.mp4")
+            os.makedirs(TEMP_DIR, exist_ok=True)
+
+            try:
+                # 下载
+                fresh = await client.get_messages(DEST_GROUP, msg.id)
+                if not fresh:
+                    continue
+                await client.download_media(fresh, file_name=tmp)
+                fsize = os.path.getsize(tmp)
+
+                # 确定来源信息
+                src_name = "unknown"
+                if fresh.forward_from_chat:
+                    src_name = safe_filename(fresh.forward_from_chat.title or str(fresh.forward_from_chat.id), max_len=30)
+
+                caption = clean_caption(fresh.caption or "")
+                safe_name = safe_filename(caption) if caption else f"video_{msg.id}"
+
+                now = fresh.date or datetime.now()
+                remote_dir = f"{P115_TARGET_DIR}/{src_name}/{now.year}-{now.month:02d}"
+                filename = f"{safe_name}.mp4"
+
+                if upload_to_115(tmp, remote_dir, filename):
+                    log.info(f"[Mirror] msg {msg.id} -> 115 OK ({fsize/1048576:.1f}MB)")
+
+                last_id = msg.id
+                with open(mirror_pf, "w") as f:
+                    json.dump({"last_id": last_id}, f)
+
+            except Exception as e:
+                log.error(f"[Mirror] msg {msg.id} error: {e}")
+                # 不推进进度，下次重试
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+
+    except Exception as e:
+        log.warning(f"[Mirror] scan error: {e}")
+
+
 async def run_once(client: Client, sources: list[dict]):
     """执行一轮: 处理所有启用的源群"""
     global _last_summary_date
@@ -1136,8 +1222,11 @@ async def main():
         write_heartbeat()
 
         try:
-            # 先检查用户命令
+            # 处理用户命令
             await check_commands(client)
+
+            # 镜像模式: 监控TGdown新消息, 自动下载→115
+            await mirror_destination(client)
 
             sources = load_sources()
 
