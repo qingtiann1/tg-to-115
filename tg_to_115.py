@@ -71,6 +71,10 @@ TEMP_DIR = os.environ.get("TEMP_DIR", "/app/temp")
 SOURCES_FILE = os.path.join(CONFIG_DIR, "sources.json")
 DEDUP_FILE = os.path.join(CONFIG_DIR, "downloaded_ids.txt")
 HEARTBEAT_FILE = os.path.join(CONFIG_DIR, ".heartbeat")
+# 回传记录: 已上传115的本地文件相对路径
+BACKFILL_DONE_FILE = os.path.join(CONFIG_DIR, "backfill_done.txt")
+# 回传基础目录 (容器内挂载的本地媒体目录下的 TGdown 文件夹)
+BACKFILL_BASE = os.path.join(DOWNLOAD_DIR, "TGdown")
 
 # 默认垃圾过滤词
 SKIP_PHRASES = [
@@ -214,6 +218,8 @@ def load_throttle() -> dict:
         "clean_days": 0,
         "days_at_cap": 0,
         "had_error": False,
+        "extra_today": 0,  # /more 临时加量 (当天有效)
+        "quota_notified": False,  # 配额满通知是否已发 (当天)
     }
 
 
@@ -254,7 +260,138 @@ def rollover_throttle(state: dict) -> dict:
     state["last_date"] = today
     state["videos_today"] = 0
     state["had_error"] = False
+    state["extra_today"] = 0  # 临时加量仅当天有效
+    state["quota_notified"] = False
     return state
+
+
+def effective_quota(state: dict) -> int:
+    """今日有效配额 = 基础配额 + /more 临时加量"""
+    return state.get("current_quota", VIDEO_QUOTA_INITIAL) + state.get("extra_today", 0)
+
+
+# ============================================================
+# 回传 (存量本地文件 → 115)
+# ============================================================
+
+def load_backfill_done() -> set[str]:
+    """已上传115的本地文件相对路径集合"""
+    if os.path.exists(BACKFILL_DONE_FILE):
+        with open(BACKFILL_DONE_FILE) as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+
+def save_backfill_done(rel_path: str):
+    with open(BACKFILL_DONE_FILE, "a") as f:
+        f.write(f"{rel_path}\n")
+
+
+def list_local_media() -> list[str]:
+    """扫描本地 TGdown 目录，返回 (相对路径) 列表，旧→新排序"""
+    if not os.path.isdir(BACKFILL_BASE):
+        return []
+    files = []
+    # 遍历年月目录 (2026_07, 2026_08 ...)，按名称排序 = 旧→新
+    for month_dir in sorted(os.listdir(BACKFILL_BASE)):
+        month_path = os.path.join(BACKFILL_BASE, month_dir)
+        if not os.path.isdir(month_path):
+            continue
+        for fn in sorted(os.listdir(month_path)):
+            fp = os.path.join(month_path, fn)
+            if os.path.isfile(fp) and fn.lower().endswith((".mp4", ".jpg", ".jpeg", ".png", ".mkv", ".mov")):
+                files.append(os.path.join(month_dir, fn))
+    return files
+
+
+def is_video_file(path: str) -> bool:
+    ext = os.path.splitext(path)[1].lower()
+    return ext in (".mp4", ".mkv", ".mov", ".avi", ".webm")
+
+
+async def backfill_115(client: Client):
+    """回传本地存量文件到 115 (旧→新，视频节流，图片自由)"""
+    if not check_115_ready():
+        return
+
+    done = load_backfill_done()
+    throttle = rollover_throttle(load_throttle())
+    files = list_local_media()
+
+    pending = [f for f in files if f not in done]
+    if not pending:
+        return
+
+    log.info(f"[Backfill] 待回传: {len(pending)} 个文件 (已传 {len(done)})")
+
+    for rel_path in pending:
+        local_path = os.path.join(BACKFILL_BASE, rel_path)
+        if not os.path.exists(local_path):
+            # 文件已删，标记完成跳过
+            save_backfill_done(rel_path)
+            done.add(rel_path)
+            continue
+
+        is_video = is_video_file(rel_path)
+        fname = os.path.basename(rel_path)
+        fsize_mb = os.path.getsize(local_path) / 1048576
+
+        # 视频配额检查
+        if is_video and throttle["videos_today"] >= effective_quota(throttle):
+            log.info(f"[Backfill] 今日视频配额已满 ({effective_quota(throttle)})，停止回传")
+            # 通知用户配额已满 (每天只发一次)
+            if not throttle.get("quota_notified", False):
+                try:
+                    await client.send_message(
+                        NOTIFY_CHAT,
+                        f"⏸️ 今日视频配额已满 ({throttle['videos_today']}/{effective_quota(throttle)})\n"
+                        f"已上传 {len(done)} 个文件\n"
+                        f"回复 <code>/more 数量</code> 继续上传更多"
+                    )
+                    throttle["quota_notified"] = True
+                    save_throttle(throttle)
+                except Exception:
+                    pass
+            break
+
+        # 上传 (115 会自动秒传去重)
+        try:
+            month_dir = os.path.dirname(rel_path)  # 如 2026_07
+            # 115 目录: gc/TGdown回传/{month_dir}/
+            remote_dir = f"TGdown回传/{month_dir}"
+            if upload_to_115(local_path, remote_dir, fname):
+                save_backfill_done(rel_path)
+                done.add(rel_path)
+
+                if is_video:
+                    throttle["videos_today"] += 1
+                    save_throttle(throttle)
+                    # 通知: 今日份额编号 + 标题
+                    title = os.path.splitext(fname)[0]
+                    try:
+                        await client.send_message(
+                            NOTIFY_CHAT,
+                            f"☁️ 已上传115 ({throttle['videos_today']}/{effective_quota(throttle)})\n"
+                            f"📹 {title}\n📦 {fsize_mb:.1f}MB"
+                        )
+                    except Exception:
+                        pass
+                    # 视频间隔 30-60s
+                    delay = random.randint(VIDEO_DELAY_MIN, VIDEO_DELAY_MAX)
+                    log.info(f"[Backfill] 视频间隔 {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    log.info(f"[Backfill] 图片已传: {fname}")
+            else:
+                throttle["had_error"] = True
+                save_throttle(throttle)
+                log.error(f"[Backfill] 上传失败: {fname}")
+        except Exception as e:
+            throttle["had_error"] = True
+            save_throttle(throttle)
+            log.error(f"[Backfill] {fname} error: {e}")
+
+    save_throttle(throttle)
 
 
 def safe_filename(text: str, max_len: int = 80) -> str:
@@ -985,6 +1122,40 @@ async def handle_command(client: Client, text: str) -> str | None:
     if text.startswith("/dl"):
         return ("__dl__", text[4:].strip())
 
+    # --- /more 临时加量 ---
+    if text.startswith("/more"):
+        n = text[5:].strip()
+        try:
+            n = int(n)
+        except ValueError:
+            return "用法: <code>/more 数量</code>，如 /more 30"
+        throttle = rollover_throttle(load_throttle())
+        throttle["extra_today"] = throttle.get("extra_today", 0) + n
+        throttle["quota_notified"] = False  # 重置，新配额满后再通知
+        save_throttle(throttle)
+        return f"✅ 今日临时加量 {n} 个视频，现在上限 {effective_quota(throttle)}/天"
+
+    # --- /new 命令说明 (所有前缀) ---
+    if text.startswith("/new"):
+        return (
+            "<b>📖 所有命令说明</b>\n\n"
+            "<code>/add 群组链接 [upload] [once]</code>\n"
+            "  添加监控群组。默认 forward(批量转发)，加 upload 表示下载上传，加 once 表示一次性\n\n"
+            "<code>/dl 消息链接</code>\n"
+            "  下载单条消息的全部图片视频 → 本地 + 上传115\n\n"
+            "<code>/more 数量</code>\n"
+            "  今日临时增加上传配额，如 /more 30\n\n"
+            "<code>/list</code> — 查看监控的群组列表\n"
+            "<code>/rm 群组名</code> — 删除监控群组\n"
+            "<code>/on 群组名</code> — 启用群组\n"
+            "<code>/off 群组名</code> — 禁用群组\n"
+            "<code>/method 群组名 forward|upload</code> — 切换转发方式\n"
+            "<code>/status</code> — 系统状态\n"
+            "<code>/115 完整Cookie</code> — 更新115登录凭证\n"
+            "<code>/new</code> — 显示本说明\n"
+            "<code>/help</code> — 快速帮助"
+        )
+
     # 保存更改
     if changed:
         save_sources(sources)
@@ -1118,8 +1289,8 @@ async def handle_download(client: Client, link: str) -> str:
                             results[-1] += " ⚠️"
                     else:
                         # 视频: 配额检查
-                        if throttle["videos_today"] >= throttle["current_quota"]:
-                            results[-1] += f" ⏸️(今日配额{throttle['current_quota']}已满)"
+                        if throttle["videos_today"] >= effective_quota(throttle):
+                            results[-1] += f" ⏸️(今日配额{effective_quota(throttle)}已满)"
                         else:
                             if upload_to_115(local_path, remote_dir, f"{safe_name}{ext}"):
                                 if fid:
@@ -1257,8 +1428,8 @@ async def mirror_destination(client: Client):
                                 uploaded_115_ids.add(fid)
                     else:
                         # 视频: 检查配额
-                        if throttle["videos_today"] >= throttle["current_quota"]:
-                            log.info(f"[Throttle] 视频配额已达 {throttle['current_quota']}/天，跳过 msg {msg.id}")
+                        if throttle["videos_today"] >= effective_quota(throttle):
+                            log.info(f"[Throttle] 视频配额已达 {effective_quota(throttle)}/天，跳过 msg {msg.id}")
                             # 不推进 last_id，等明天继续
                             break
                         if upload_to_115(local_path, remote_dir, f"{safe_name}{ext}"):
@@ -1267,7 +1438,7 @@ async def mirror_destination(client: Client):
                                 uploaded_115_ids.add(fid)
                             throttle["videos_today"] += 1
                             save_throttle(throttle)
-                            log.info(f"[Throttle] 今日视频: {throttle['videos_today']}/{throttle['current_quota']}")
+                            log.info(f"[Throttle] 今日视频: {throttle['videos_today']}/{effective_quota(throttle)}")
                             # 视频间隔 30-60s 随机
                             delay = random.randint(VIDEO_DELAY_MIN, VIDEO_DELAY_MAX)
                             log.info(f"[Throttle] 视频间隔 {delay}s...")
@@ -1446,6 +1617,9 @@ async def main():
 
             # 镜像模式: 监控TGdown新消息, 自动下载→115
             await mirror_destination(client)
+
+            # 回传存量本地文件 (每天自动，配额内)
+            await backfill_115(client)
 
             sources = load_sources()
 
