@@ -202,6 +202,9 @@ VIDEO_QUOTA_FINAL = 200
 VIDEO_QUOTA_FINAL_DAYS = 15
 VIDEO_DELAY_MIN = 30
 VIDEO_DELAY_MAX = 60
+# 自动续传: 配额满后 N 小时无风控无回复 → 自动 +60
+AUTO_EXTEND_HOURS = 3
+AUTO_EXTEND_COUNT = 60
 
 
 def load_throttle() -> dict:
@@ -220,6 +223,8 @@ def load_throttle() -> dict:
         "had_error": False,
         "extra_today": 0,  # /more 临时加量 (当天有效)
         "quota_notified": False,  # 配额满通知是否已发 (当天)
+        "quota_reached_time": None,  # 配额首次满的时间戳 (自动续传用)
+        "auto_extended": False,  # 本轮是否已自动续传
     }
 
 
@@ -262,6 +267,8 @@ def rollover_throttle(state: dict) -> dict:
     state["had_error"] = False
     state["extra_today"] = 0  # 临时加量仅当天有效
     state["quota_notified"] = False
+    state["quota_reached_time"] = None
+    state["auto_extended"] = False
     return state
 
 
@@ -309,6 +316,45 @@ def is_video_file(path: str) -> bool:
     return ext in (".mp4", ".mkv", ".mov", ".avi", ".webm")
 
 
+async def maybe_auto_extend(throttle: dict, client: Client) -> bool:
+    """配额满时检查自动续传: 3小时无风控无回复 → 自动 +60。返回是否已续传"""
+    now_ts = time.time()
+    reached = throttle.get("quota_reached_time")
+
+    if reached is None:
+        # 首次满，记录时间戳
+        throttle["quota_reached_time"] = now_ts
+        throttle["auto_extended"] = False
+        save_throttle(throttle)
+        return False
+
+    if throttle.get("auto_extended", False):
+        return False  # 本轮已续传过
+
+    if throttle.get("had_error", False):
+        return False  # 有风控，不自动续传
+
+    elapsed = now_ts - reached
+    if elapsed >= AUTO_EXTEND_HOURS * 3600:
+        throttle["extra_today"] = throttle.get("extra_today", 0) + AUTO_EXTEND_COUNT
+        throttle["auto_extended"] = True
+        throttle["quota_reached_time"] = None  # 重置，新配额满后再计时
+        throttle["quota_notified"] = False
+        save_throttle(throttle)
+        try:
+            await client.send_message(
+                NOTIFY_CHAT,
+                f"🔄 {AUTO_EXTEND_HOURS}小时无风控，自动续传 {AUTO_EXTEND_COUNT} 个视频\n"
+                f"现在上限 {effective_quota(throttle)}/天"
+            )
+        except Exception:
+            pass
+        log.info(f"[Backfill] 自动续传 +{AUTO_EXTEND_COUNT}，新上限 {effective_quota(throttle)}")
+        return True
+
+    return False
+
+
 async def backfill_115(client: Client):
     """回传本地存量文件到 115 (旧→新，视频节流，图片自由)"""
     if not check_115_ready():
@@ -338,21 +384,27 @@ async def backfill_115(client: Client):
 
         # 视频配额检查
         if is_video and throttle["videos_today"] >= effective_quota(throttle):
-            log.info(f"[Backfill] 今日视频配额已满 ({effective_quota(throttle)})，停止回传")
-            # 通知用户配额已满 (每天只发一次)
-            if not throttle.get("quota_notified", False):
-                try:
-                    await client.send_message(
-                        NOTIFY_CHAT,
-                        f"⏸️ 今日视频配额已满 ({throttle['videos_today']}/{effective_quota(throttle)})\n"
-                        f"已上传 {len(done)} 个文件\n"
-                        f"回复 <code>/more 数量</code> 继续上传更多"
-                    )
-                    throttle["quota_notified"] = True
-                    save_throttle(throttle)
-                except Exception:
-                    pass
-            break
+            # 检查是否自动续传 (3小时无风控无回复 → +60)
+            if await maybe_auto_extend(throttle, client):
+                # 续传成功，继续处理当前文件 (不 break)
+                pass
+            else:
+                log.info(f"[Backfill] 今日视频配额已满 ({effective_quota(throttle)})，停止回传")
+                # 通知用户配额已满 (每天只发一次)
+                if not throttle.get("quota_notified", False):
+                    try:
+                        await client.send_message(
+                            NOTIFY_CHAT,
+                            f"⏸️ 今日视频配额已满 ({throttle['videos_today']}/{effective_quota(throttle)})\n"
+                            f"已上传 {len(done)} 个文件\n"
+                            f"回复 <code>/more 数量</code> 继续上传更多\n"
+                            f"或 {AUTO_EXTEND_HOURS} 小时后无风控自动续传 {AUTO_EXTEND_COUNT}"
+                        )
+                        throttle["quota_notified"] = True
+                        save_throttle(throttle)
+                    except Exception:
+                        pass
+                break
 
         # 上传 (115 会自动秒传去重)
         try:
@@ -1132,6 +1184,8 @@ async def handle_command(client: Client, text: str) -> str | None:
         throttle = rollover_throttle(load_throttle())
         throttle["extra_today"] = throttle.get("extra_today", 0) + n
         throttle["quota_notified"] = False  # 重置，新配额满后再通知
+        throttle["quota_reached_time"] = None  # 重置自动续传计时
+        throttle["auto_extended"] = False
         save_throttle(throttle)
         return f"✅ 今日临时加量 {n} 个视频，现在上限 {effective_quota(throttle)}/天"
 
