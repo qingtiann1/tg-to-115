@@ -7,7 +7,9 @@ services:
       - .env
     volumes:
       - ./config:/app/config        # session + sources.json + 115-cookies.txt + progress
-      - ./downloads:/app/downloads   # 可选: 下载文件持久化
+      # 本地下载目录 (复用旧 tg-downloader 的媒体库路径)
+      # NAS 上改为: /vol2/1000/media/tg_videos:/app/downloads
+      - ./downloads:/app/downloads
     environment:
       - TZ=Asia/Shanghai
     # 如果 Telegram 需要走宿主代理，修改 .env 中的 TG_PROXY 即可

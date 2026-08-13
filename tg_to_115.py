@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import sys
@@ -154,6 +155,106 @@ def load_dedup_ids() -> set[str]:
 def save_dedup_id(fid: str):
     with open(DEDUP_FILE, "a") as f:
         f.write(f"{fid}\n")
+
+
+# 115 已上传记录 (file_unique_id)
+UPLOADED_115_FILE = os.path.join(CONFIG_DIR, "uploaded_115_ids.txt")
+
+
+def load_uploaded_115_ids() -> set[str]:
+    if os.path.exists(UPLOADED_115_FILE):
+        with open(UPLOADED_115_FILE) as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+
+def save_uploaded_115_id(fid: str):
+    with open(UPLOADED_115_FILE, "a") as f:
+        f.write(f"{fid}\n")
+
+
+def get_file_unique_id(msg) -> str:
+    """提取消息的 file_unique_id (用于去重)"""
+    if msg.video:
+        return msg.video.file_unique_id
+    if msg.photo:
+        return msg.photo.file_unique_id
+    if msg.document:
+        return msg.document.file_unique_id
+    return ""
+
+
+# ============================================================
+# 上传节流 (115 风控防护)
+# ============================================================
+THROTTLE_FILE = os.path.join(CONFIG_DIR, "throttle_state.json")
+
+# 视频配额: 初始60/天, 连续2天不风控+10, 上限150, 150跑15天→200
+VIDEO_QUOTA_INITIAL = 60
+VIDEO_QUOTA_MAX = 150
+VIDEO_QUOTA_STEP = 10
+VIDEO_QUOTA_STEP_DAYS = 2
+VIDEO_QUOTA_FINAL = 200
+VIDEO_QUOTA_FINAL_DAYS = 15
+VIDEO_DELAY_MIN = 30
+VIDEO_DELAY_MAX = 60
+
+
+def load_throttle() -> dict:
+    if os.path.exists(THROTTLE_FILE):
+        try:
+            with open(THROTTLE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "current_quota": VIDEO_QUOTA_INITIAL,
+        "last_date": "",
+        "videos_today": 0,
+        "clean_days": 0,
+        "days_at_cap": 0,
+        "had_error": False,
+    }
+
+
+def save_throttle(state: dict):
+    with open(THROTTLE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def rollover_throttle(state: dict) -> dict:
+    """日结算: 新的一天，根据昨天是否风控调整配额"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if state.get("last_date") == today:
+        return state
+
+    # 昨天结算
+    if not state.get("had_error", False):
+        state["clean_days"] = state.get("clean_days", 0) + 1
+    else:
+        state["clean_days"] = 0  # 有风控，重置连续天数
+
+    # 配额升级
+    quota = state.get("current_quota", VIDEO_QUOTA_INITIAL)
+    if quota == VIDEO_QUOTA_FINAL:
+        pass  # 已达最终上限
+    elif quota == VIDEO_QUOTA_MAX:
+        state["days_at_cap"] = state.get("days_at_cap", 0) + 1
+        if state["days_at_cap"] >= VIDEO_QUOTA_FINAL_DAYS:
+            state["current_quota"] = VIDEO_QUOTA_FINAL
+            state["days_at_cap"] = 0
+            log.info(f"[Throttle] 配额升级: {VIDEO_QUOTA_MAX} → {VIDEO_QUOTA_FINAL}/天")
+    elif state["clean_days"] >= VIDEO_QUOTA_STEP_DAYS:
+        new_quota = min(quota + VIDEO_QUOTA_STEP, VIDEO_QUOTA_MAX)
+        state["current_quota"] = new_quota
+        state["clean_days"] = 0
+        log.info(f"[Throttle] 配额升级: {quota} → {new_quota}/天")
+
+    # 重置当天计数
+    state["last_date"] = today
+    state["videos_today"] = 0
+    state["had_error"] = False
+    return state
 
 
 def safe_filename(text: str, max_len: int = 80) -> str:
@@ -892,9 +993,7 @@ async def handle_command(client: Client, text: str) -> str | None:
 
 
 async def handle_download(client: Client, link: str) -> str:
-    """处理 /dl 命令: 下载单条视频 → 115 → TGdown"""
-    import tempfile as tmp_mod
-
+    """处理 /dl 命令: 下载单条视频 → 本地落地 → 上传115"""
     # 解析链接: https://t.me/xxx/12345 或 https://t.me/c/123456789/4205
     m = re.search(r"(?:https?://)?t(?:elegram)?\.me/(?:c/)?([^/\s]+)/(\d+)", link)
     if not m:
@@ -957,12 +1056,17 @@ async def handle_download(client: Client, link: str) -> str:
         if not caption and fresh.caption:
             caption = clean_caption(fresh.caption)
 
-        # 下载和上传所有媒体
+        # 下载和上传所有媒体 (本地落地 + 去重 + 节流)
         p115_ok = check_115_ready()
+        downloaded_ids = load_dedup_ids()
+        uploaded_115_ids = load_uploaded_115_ids()
+        throttle = rollover_throttle(load_throttle())
         src_title = safe_filename(src.title or str(src.id), max_len=30)
         now = fresh.date or datetime.now()
-        remote_dir = f"{src_title}/{now.year}-{now.month:02d}"
-        os.makedirs(TEMP_DIR, exist_ok=True)
+        year_month = f"{now.year}_{now.month:02d}"
+        remote_dir = f"{src_title}/{year_month}"
+        local_dir = os.path.join(DOWNLOAD_DIR, "TGdown", year_month)
+        os.makedirs(local_dir, exist_ok=True)
 
         results = []
         for i, m in enumerate(media_items):
@@ -970,30 +1074,74 @@ async def handle_download(client: Client, link: str) -> str:
             base = caption if caption else "media"
             title = f"{base} {num}" if len(media_items) > 1 else base
             ext = ".jpg" if m.photo else ".mp4"
-            tmp = tmp_mod.mktemp(suffix=ext, dir=TEMP_DIR)
+            is_photo = bool(m.photo)
+            fid = get_file_unique_id(m)
+            safe_name = safe_filename(title)
+            local_path = os.path.join(local_dir, f"{safe_name}{ext}")
+
+            is_downloaded = fid in downloaded_ids if fid else False
+            is_uploaded = fid in uploaded_115_ids if fid else False
+            label = "📷" if is_photo else "📹"
+
+            # 已下载+已上传 → 拒绝重复
+            if is_downloaded and is_uploaded:
+                results.append(f"{label} {title} (本地已存在,跳过)")
+                continue
 
             try:
-                await client.download_media(m, file_name=tmp)
-                fsize = os.path.getsize(tmp)
-                label = "📷" if m.photo else "📹"
+                # 下载到本地 (仅当未下载)
+                if not is_downloaded:
+                    fresh_m = await client.get_messages(src.id, m.id)
+                    if fresh_m:
+                        await client.download_media(fresh_m, file_name=local_path)
+                        if fid:
+                            save_dedup_id(fid)
+                            downloaded_ids.add(fid)
+                elif not os.path.exists(local_path):
+                    fresh_m = await client.get_messages(src.id, m.id)
+                    if fresh_m:
+                        await client.download_media(fresh_m, file_name=local_path)
+
+                fsize = os.path.getsize(local_path) if os.path.exists(local_path) else 0
                 results.append(f"{label} {title} ({fsize/1048576:.1f}MB)")
 
-                # 上传115
-                if p115_ok:
-                    safe_name = safe_filename(title)
-                    if upload_to_115(tmp, remote_dir, f"{safe_name}{ext}"):
-                        results[-1] += " ☁️"
+                # 上传115 (节流)
+                if p115_ok and not is_uploaded:
+                    if is_photo:
+                        # 图片不计数不间隔
+                        if upload_to_115(local_path, remote_dir, f"{safe_name}{ext}"):
+                            if fid:
+                                save_uploaded_115_id(fid)
+                                uploaded_115_ids.add(fid)
+                            results[-1] += " ☁️"
+                        else:
+                            results[-1] += " ⚠️"
                     else:
-                        results[-1] += " ⚠️"
+                        # 视频: 配额检查
+                        if throttle["videos_today"] >= throttle["current_quota"]:
+                            results[-1] += f" ⏸️(今日配额{throttle['current_quota']}已满)"
+                        else:
+                            if upload_to_115(local_path, remote_dir, f"{safe_name}{ext}"):
+                                if fid:
+                                    save_uploaded_115_id(fid)
+                                    uploaded_115_ids.add(fid)
+                                throttle["videos_today"] += 1
+                                results[-1] += " ☁️"
+                                delay = random.randint(VIDEO_DELAY_MIN, VIDEO_DELAY_MAX)
+                                await asyncio.sleep(delay)
+                            else:
+                                throttle["had_error"] = True
+                                results[-1] += " ⚠️"
+                elif is_uploaded:
+                    results[-1] += " ☁️(已传)"
             except Exception as e:
                 results.append(f"❌ #{num}: {str(e)[:60]}")
-            finally:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
+                throttle["had_error"] = True
 
+        save_throttle(throttle)
         total = len(media_items)
         p115_status = "☁️ 115: 已上传" if p115_ok else "\n⚠️ 115: Cookie未配置"
-        return f"✅ 下载完成 ({total}个文件)\n" + "\n".join(results) + f"\n📂 {remote_dir}{p115_status}"
+        return f"✅ 处理完成 ({total}个文件)\n" + "\n".join(results) + f"\n📂 {remote_dir}{p115_status}"
 
     except Exception as e:
         log.error(f"[DL] Error: {e}")
@@ -1009,8 +1157,8 @@ _last_summary_date = ""
 
 async def mirror_destination(client: Client):
     """
-    监控目标群(TGdown)的新消息: 下载媒体 → 上传115
-    用户只需转发视频到TGdown，系统自动处理
+    监控目标群(TGdown)的新消息: 下载到本地 → 上传115
+    用户转发视频到TGdown，系统自动下载落地 + 上传115 (带节流)
     """
     if DEST_GROUP == 0:
         return
@@ -1025,12 +1173,18 @@ async def mirror_destination(client: Client):
         except Exception:
             pass
 
+    # 去重集合
+    downloaded_ids = load_dedup_ids()
+    uploaded_115_ids = load_uploaded_115_ids()
+
+    # 节流状态
+    throttle = rollover_throttle(load_throttle())
+
     try:
         new_msgs = []
-        async for msg in client.get_chat_history(DEST_GROUP, limit=20):
+        async for msg in client.get_chat_history(DEST_GROUP, limit=30):
             if msg.id <= last_id:
                 break
-            # 跳过非媒体、自己的消息、旧消息
             if not msg.video and not msg.photo and not msg.document:
                 continue
             if msg.from_user and msg.from_user.is_self:
@@ -1038,54 +1192,89 @@ async def mirror_destination(client: Client):
             new_msgs.append(msg)
 
         if not new_msgs:
+            save_throttle(throttle)
             return
 
-        # 检查115
         p115_ok = check_115_ready()
-        if not p115_ok:
-            # 只保存进度，不上传
-            max_id = max(m.id for m in new_msgs)
-            with open(mirror_pf, "w") as f:
-                json.dump({"last_id": max_id}, f)
-            return
 
-        # 从新到旧处理 (先处理最新的)
+        # 从旧到新处理
         for msg in reversed(new_msgs):
-            log.info(f"[Mirror] Processing msg {msg.id}")
-            tmp = os.path.join(TEMP_DIR, f"mirror_{msg.id}.mp4")
-            os.makedirs(TEMP_DIR, exist_ok=True)
+            fid = get_file_unique_id(msg)
+            is_downloaded = fid in downloaded_ids if fid else False
+            is_uploaded = fid in uploaded_115_ids if fid else False
+
+            # 已下载 + 已上传 → 跳过
+            if is_downloaded and is_uploaded:
+                last_id = msg.id
+                continue
+
+            is_photo = bool(msg.photo)
+            caption = clean_caption(msg.caption or "")
+            safe_name = safe_filename(caption) if caption else f"video_{msg.id}"
+            ext = ".jpg" if is_photo else ".mp4"
+            now = msg.date or datetime.now()
+            year_month = f"{now.year}_{now.month:02d}"
+
+            # 本地路径: /app/downloads/TGdown/{YYYY_MM}/{标题}.{ext}
+            local_dir = os.path.join(DOWNLOAD_DIR, "TGdown", year_month)
+            local_path = os.path.join(local_dir, f"{safe_name}{ext}")
 
             try:
-                # 下载
-                fresh = await client.get_messages(DEST_GROUP, msg.id)
-                if not fresh:
-                    continue
-                await client.download_media(fresh, file_name=tmp)
-                fsize = os.path.getsize(tmp)
+                # === 下载到本地 (仅当未下载过) ===
+                if not is_downloaded:
+                    os.makedirs(local_dir, exist_ok=True)
+                    fresh = await client.get_messages(DEST_GROUP, msg.id)
+                    if not fresh:
+                        continue
+                    await client.download_media(fresh, file_name=local_path)
+                    fsize = os.path.getsize(local_path)
+                    if fid:
+                        save_dedup_id(fid)
+                        downloaded_ids.add(fid)
+                    log.info(f"[Mirror] Downloaded: {local_path} ({fsize/1048576:.1f}MB)")
+                else:
+                    log.info(f"[Mirror] msg {msg.id} already downloaded, skip download")
+                    if not os.path.exists(local_path):
+                        # 记录有但文件不存在(可能已删)，重新下载
+                        os.makedirs(local_dir, exist_ok=True)
+                        fresh = await client.get_messages(DEST_GROUP, msg.id)
+                        if fresh:
+                            await client.download_media(fresh, file_name=local_path)
+                            log.info(f"[Mirror] Re-downloaded (file was missing): {local_path}")
 
-                # 确定来源信息
-                src_name = "unknown"
-                if fresh.forward_from_chat:
-                    src_name = safe_filename(fresh.forward_from_chat.title or str(fresh.forward_from_chat.id), max_len=30)
+                # === 上传115 (节流) ===
+                if p115_ok and not is_uploaded:
+                    src_name = "unknown"
+                    if msg.forward_from_chat:
+                        src_name = safe_filename(msg.forward_from_chat.title or str(msg.forward_from_chat.id), max_len=30)
+                    remote_dir = f"{src_name}/{year_month}"
 
-                caption = clean_caption(fresh.caption or "")
-                safe_name = safe_filename(caption) if caption else f"video_{msg.id}"
-
-                now = fresh.date or datetime.now()
-                remote_dir = f"{src_name}/{now.year}-{now.month:02d}"
-                filename = f"{safe_name}.mp4"
-
-                if upload_to_115(tmp, remote_dir, filename):
-                    log.info(f"[Mirror] msg {msg.id} -> 115 OK ({fsize/1048576:.1f}MB)")
-                    # 通知用户
-                    try:
-                        cap_preview = (caption[:50] + "...") if len(caption) > 50 else caption
-                        await client.send_message(
-                            NOTIFY_CHAT,
-                            f"☁️ 已上传115\n📹 {cap_preview if cap_preview else '(无标题)'}\n📦 {fsize/1048576:.1f}MB\n📂 {remote_dir}"
-                        )
-                    except Exception:
-                        pass
+                    if is_photo:
+                        # 图片: 不计数、不间隔
+                        if upload_to_115(local_path, remote_dir, f"{safe_name}{ext}"):
+                            if fid:
+                                save_uploaded_115_id(fid)
+                                uploaded_115_ids.add(fid)
+                    else:
+                        # 视频: 检查配额
+                        if throttle["videos_today"] >= throttle["current_quota"]:
+                            log.info(f"[Throttle] 视频配额已达 {throttle['current_quota']}/天，跳过 msg {msg.id}")
+                            # 不推进 last_id，等明天继续
+                            break
+                        if upload_to_115(local_path, remote_dir, f"{safe_name}{ext}"):
+                            if fid:
+                                save_uploaded_115_id(fid)
+                                uploaded_115_ids.add(fid)
+                            throttle["videos_today"] += 1
+                            save_throttle(throttle)
+                            log.info(f"[Throttle] 今日视频: {throttle['videos_today']}/{throttle['current_quota']}")
+                            # 视频间隔 30-60s 随机
+                            delay = random.randint(VIDEO_DELAY_MIN, VIDEO_DELAY_MAX)
+                            log.info(f"[Throttle] 视频间隔 {delay}s...")
+                            await asyncio.sleep(delay)
+                        else:
+                            throttle["had_error"] = True
+                            save_throttle(throttle)
 
                 last_id = msg.id
                 with open(mirror_pf, "w") as f:
@@ -1093,13 +1282,13 @@ async def mirror_destination(client: Client):
 
             except Exception as e:
                 log.error(f"[Mirror] msg {msg.id} error: {e}")
-                # 不推进进度，下次重试
-            finally:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
+                throttle["had_error"] = True
+                save_throttle(throttle)
 
     except Exception as e:
         log.warning(f"[Mirror] scan error: {e}")
+
+    save_throttle(throttle)
 
 
 async def run_once(client: Client, sources: list[dict]):
