@@ -205,6 +205,8 @@ VIDEO_DELAY_MAX = 60
 # 自动续传: 配额满后 N 小时无风控无回复 → 自动 +60
 AUTO_EXTEND_HOURS = 3
 AUTO_EXTEND_COUNT = 60
+# 每日视频上限: 0 = 取消限制 (环境变量 VIDEO_DAILY_LIMIT 可覆盖)
+VIDEO_DAILY_LIMIT = int(os.environ.get("VIDEO_DAILY_LIMIT", "0"))
 
 
 def load_throttle() -> dict:
@@ -273,7 +275,9 @@ def rollover_throttle(state: dict) -> dict:
 
 
 def effective_quota(state: dict) -> int:
-    """今日有效配额 = 基础配额 + /more 临时加量"""
+    """今日有效配额 = 基础配额 + /more 临时加量。VIDEO_DAILY_LIMIT=0 时取消限制"""
+    if VIDEO_DAILY_LIMIT == 0:
+        return 999999  # 取消每日上限
     return state.get("current_quota", VIDEO_QUOTA_INITIAL) + state.get("extra_today", 0)
 
 
