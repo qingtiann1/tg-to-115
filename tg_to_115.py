@@ -59,6 +59,8 @@ DEST_GROUP = int(os.environ.get("TG_DEST_GROUP", "0"))
 PROXY_URL = os.environ.get("TG_PROXY", "")
 P115_COOKIE_FILE = os.environ.get("P115_COOKIE_FILE", "/root/115-cookies.txt")
 P115_TARGET_DIR = os.environ.get("P115_TARGET_DIR", "/beifen")
+# 115 目标文件夹 CID (数字文件夹ID，如"gc"文件夹)
+P115_TARGET_CID = os.environ.get("P115_TARGET_CID", "3325027625594783571")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
 NOTIFY_CHAT = os.environ.get("NOTIFY_CHAT_ID", "me")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/config")
@@ -184,19 +186,24 @@ def check_115_ready() -> bool:
 def upload_to_115(filepath: str, remote_dir: str, filename: str) -> bool:
     """
     上传文件到 115 网盘
-    使用 p115client Python API (内置: 秒传 + 大文件分块上传)
+    remote_dir: 目标文件夹CID下的子目录 (如 "群组名/2026-08")
+    filename:   文件名
     """
-    remote_path = f"{remote_dir}/{filename}"
     fsize_mb = os.path.getsize(filepath) / 1048576
-    log.info(f"  [115] Uploading: {os.path.basename(filepath)} -> {remote_path} ({fsize_mb:.1f}MB)")
+    log.info(f"  [115] Uploading: {os.path.basename(filepath)} -> {P115_TARGET_CID}/{remote_dir}/{filename} ({fsize_mb:.1f}MB)")
 
     try:
         from p115client import P115Client
         from pathlib import Path
 
         client = P115Client(Path(P115_COOKIE_FILE))
-        # p115client 的 upload_file 自动处理秒传和分块上传
-        result = client.upload_file(filepath, remote_path)
+        # pid = 目标文件夹CID, dirname = 子目录, filename = 文件名
+        result = client.upload_file(
+            filepath,
+            pid=int(P115_TARGET_CID),
+            dirname=remote_dir,
+            filename=filename,
+        )
         log.info(f"  [115] OK ({fsize_mb:.1f}MB)")
         return True
     except Exception as e:
@@ -488,7 +495,7 @@ async def process_upload(client: Client, src, dst, cfg: dict):
             if p115_ready:
                 src_title = safe_filename(src.title if src.title else str(src.id), max_len=30)
                 now = fresh.date or datetime.now()
-                remote_dir = f"{P115_TARGET_DIR}/{src_title}/{now.year}-{now.month:02d}"
+                remote_dir = f"{src_title}/{now.year}-{now.month:02d}"
                 safe_name = safe_filename(cap) if cap else f"video_{msg.id}"
                 filename = f"{safe_name}.mp4"
                 upload_to_115(tmp_path, remote_dir, filename)
@@ -538,7 +545,7 @@ async def process_upload(client: Client, src, dst, cfg: dict):
                     if p115_ready:
                         src_title = safe_filename(src.title or str(src.id), max_len=30)
                         now = fresh.date or datetime.now()
-                        remote_dir = f"{P115_TARGET_DIR}/{src_title}/{now.year}-{now.month:02d}"
+                        remote_dir = f"{src_title}/{now.year}-{now.month:02d}"
                         safe_name = safe_filename(cap) if cap else f"video_{msg.id}"
                         upload_to_115(tmp_path, remote_dir, f"{safe_name}.mp4")
                     if fresh.video:
@@ -954,7 +961,7 @@ async def handle_download(client: Client, link: str) -> str:
         p115_ok = check_115_ready()
         src_title = safe_filename(src.title or str(src.id), max_len=30)
         now = fresh.date or datetime.now()
-        remote_dir = f"{P115_TARGET_DIR}/{src_title}/{now.year}-{now.month:02d}"
+        remote_dir = f"{src_title}/{now.year}-{now.month:02d}"
         os.makedirs(TEMP_DIR, exist_ok=True)
 
         results = []
@@ -1065,7 +1072,7 @@ async def mirror_destination(client: Client):
                 safe_name = safe_filename(caption) if caption else f"video_{msg.id}"
 
                 now = fresh.date or datetime.now()
-                remote_dir = f"{P115_TARGET_DIR}/{src_name}/{now.year}-{now.month:02d}"
+                remote_dir = f"{src_name}/{now.year}-{now.month:02d}"
                 filename = f"{safe_name}.mp4"
 
                 if upload_to_115(tmp, remote_dir, filename):
