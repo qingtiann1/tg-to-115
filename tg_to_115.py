@@ -63,6 +63,8 @@ P115_TARGET_DIR = os.environ.get("P115_TARGET_DIR", "/beifen")
 # 115 目标文件夹 CID (数字文件夹ID，如"gc"文件夹)
 P115_TARGET_CID = os.environ.get("P115_TARGET_CID", "3325027625594783571")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
+# 115 上传超时(秒)：单个文件上传放线程池执行，超时跳过，避免 OSS 连接 hang 卡死 backfill
+UPLOAD_TIMEOUT = int(os.environ.get("UPLOAD_TIMEOUT", "600"))
 NOTIFY_CHAT = os.environ.get("NOTIFY_CHAT_ID", "me")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/config")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/app/downloads")
@@ -415,7 +417,11 @@ async def backfill_115(client: Client):
             month_dir = os.path.dirname(rel_path)  # 如 2026_07
             # 115 目录: gc/TGdown回传/{month_dir}/
             remote_dir = f"TGdown回传/{month_dir}"
-            if upload_to_115(local_path, remote_dir, fname):
+            ok = await asyncio.wait_for(
+                asyncio.to_thread(upload_to_115, local_path, remote_dir, fname),
+                timeout=UPLOAD_TIMEOUT,
+            )
+            if ok:
                 save_backfill_done(rel_path)
                 done.add(rel_path)
 
@@ -442,6 +448,10 @@ async def backfill_115(client: Client):
                 throttle["had_error"] = True
                 save_throttle(throttle)
                 log.error(f"[Backfill] 上传失败: {fname}")
+        except asyncio.TimeoutError:
+            throttle["had_error"] = True
+            save_throttle(throttle)
+            log.error(f"[Backfill] 上传超时 {UPLOAD_TIMEOUT}s，跳过: {fname} ({fsize_mb:.1f}MB)")
         except Exception as e:
             throttle["had_error"] = True
             save_throttle(throttle)
