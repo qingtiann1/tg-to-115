@@ -448,9 +448,10 @@ async def backfill_115(client: Client):
             log.error(f"[Backfill] {fname} error: {e}")
 
         # 每个文件处理后刷新心跳 + 检查命令 (backfill 长任务期间 /status 也能响应)
+        # 加超时，避免 TG 连接断时 check_commands 的 GetFullUser 重试阻塞 115 上传
         write_heartbeat()
         try:
-            await check_commands(client)
+            await asyncio.wait_for(check_commands(client), timeout=8)
         except Exception:
             pass
 
