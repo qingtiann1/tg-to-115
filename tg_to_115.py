@@ -63,8 +63,6 @@ P115_TARGET_DIR = os.environ.get("P115_TARGET_DIR", "/beifen")
 # 115 目标文件夹 CID (数字文件夹ID，如"gc"文件夹)
 P115_TARGET_CID = os.environ.get("P115_TARGET_CID", "3325027625594783571")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
-# 命令轮询间隔: 后台独立任务每 N 秒检查一次命令，不受 backfill 长任务阻塞
-CMD_POLL_INTERVAL = int(os.environ.get("CMD_POLL_INTERVAL", "30"))
 NOTIFY_CHAT = os.environ.get("NOTIFY_CHAT_ID", "me")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", "/app/config")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/app/downloads")
@@ -448,6 +446,13 @@ async def backfill_115(client: Client):
             throttle["had_error"] = True
             save_throttle(throttle)
             log.error(f"[Backfill] {fname} error: {e}")
+
+        # 每个文件处理后刷新心跳 + 检查命令 (backfill 长任务期间 /status 也能响应)
+        write_heartbeat()
+        try:
+            await check_commands(client)
+        except Exception:
+            pass
 
     save_throttle(throttle)
 
@@ -1591,17 +1596,6 @@ async def run_once(client: Client, sources: list[dict]):
             pass
 
 
-async def command_loop(client: Client):
-    """独立命令轮询任务: backfill 长时间运行时也能及时响应 /status 等命令，并持续刷新心跳"""
-    while True:
-        write_heartbeat()
-        try:
-            await check_commands(client)
-        except Exception as e:
-            log.warning(f"Command loop error: {e}")
-        await asyncio.sleep(CMD_POLL_INTERVAL)
-
-
 async def main():
     log.info("=" * 50)
     log.info("tg-to-115 starting...")
@@ -1678,14 +1672,14 @@ async def main():
     # 启动通知
     await notify(client, f"🟢 tg-to-115 已启动\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # 命令轮询独立后台任务 (backfill 长任务期间也能响应命令、刷新心跳)
-    cmd_task = asyncio.create_task(command_loop(client))
-
     # 主循环
     while True:
         write_heartbeat()
 
         try:
+            # 处理用户命令
+            await check_commands(client)
+
             # 镜像模式: 监控TGdown新消息, 自动下载→115
             await mirror_destination(client)
 
