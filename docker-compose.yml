@@ -6,13 +6,13 @@ services:
     env_file:
       - .env
     volumes:
-      - ./config:/app/config        # session + sources.json + 115-cookies.txt + progress
-      # 本地下载目录 (复用旧 tg-downloader 的媒体库路径)
-      # NAS 上改为: /vol2/1000/media/tg_videos:/app/downloads
-      - ./downloads:/app/downloads
+      - ./config:/app/config
+      - /vol2/1000/media/tg_videos:/app/downloads
     environment:
       - TZ=Asia/Shanghai
-    # 如果 Telegram 需要走宿主代理，修改 .env 中的 TG_PROXY 即可
-    # 容器内使用 host.docker.internal 访问宿主机端口:
-    # extra_hosts:
-    #   - "host.docker.internal:host-gateway"
+    networks:
+      - docker_isweet
+
+networks:
+  docker_isweet:
+    external: true

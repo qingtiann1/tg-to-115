@@ -810,7 +810,10 @@ async def process_upload(client: Client, src, dst, cfg: dict):
                 remote_dir = f"{src_title}/{now.year}-{now.month:02d}"
                 safe_name = safe_filename(cap) if cap else f"video_{msg.id}"
                 filename = f"{safe_name}.mp4"
-                upload_to_115(tmp_path, remote_dir, filename)
+                await asyncio.wait_for(
+                    asyncio.to_thread(upload_to_115, tmp_path, remote_dir, filename),
+                    timeout=UPLOAD_TIMEOUT,
+                )
 
             # === 上传到目标群 (TGdown) ===
             log.info(f"  Sending to destination...")
@@ -859,7 +862,10 @@ async def process_upload(client: Client, src, dst, cfg: dict):
                         now = fresh.date or datetime.now()
                         remote_dir = f"{src_title}/{now.year}-{now.month:02d}"
                         safe_name = safe_filename(cap) if cap else f"video_{msg.id}"
-                        upload_to_115(tmp_path, remote_dir, f"{safe_name}.mp4")
+                        await asyncio.wait_for(
+                            asyncio.to_thread(upload_to_115, tmp_path, remote_dir, f"{safe_name}.mp4"),
+                            timeout=UPLOAD_TIMEOUT,
+                        )
                     if fresh.video:
                         await client.send_video(dst.id, tmp_path, caption=cap,
                                                 width=fresh.video.width,
