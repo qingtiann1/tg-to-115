@@ -1463,6 +1463,30 @@ async def mirror_destination(client: Client):
 
             is_photo = bool(msg.photo)
             caption = clean_caption(msg.caption or "")
+            # 相册标题合并: 相册成员消息通常无 caption，向前/向后找同 media_group 的第一条有标题消息
+            if not caption:
+                mgid = getattr(msg, "media_group_id", None)
+                if mgid:
+                    seen = set()
+                    try:
+                        async for m in client.get_chat_history(DEST_GROUP, limit=60, offset_id=msg.id + 30):
+                            if getattr(m, "media_group_id", None) == mgid and m.id not in seen:
+                                seen.add(m.id)
+                                if m.caption:
+                                    caption = clean_caption(m.caption)
+                                    break
+                    except Exception:
+                        pass
+                    if not caption:
+                        try:
+                            async for m in client.get_chat_history(DEST_GROUP, limit=60, offset_id=msg.id - 30):
+                                if getattr(m, "media_group_id", None) == mgid and m.id not in seen:
+                                    seen.add(m.id)
+                                    if m.caption:
+                                        caption = clean_caption(m.caption)
+                                        break
+                        except Exception:
+                            pass
             safe_name = safe_filename(caption) if caption else f"video_{msg.id}"
             ext = ".jpg" if is_photo else ".mp4"
             now = msg.date or datetime.now()
