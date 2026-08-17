@@ -623,9 +623,9 @@ async def process_forward(client: Client, src, dst, cfg: dict):
 
     log.info(f"[{name}] Scanning (forward mode)...")
 
-    # 获取全部消息 (倒序)
+    # 增量获取：只拉 last_id 之后的新消息（避免每次全量读群历史）
     all_msgs = []
-    async for msg in client.get_chat_history(src.id):
+    async for msg in client.get_chat_history(src.id, offset_id=last_id, limit=500):
         all_msgs.append(msg)
     all_msgs.reverse()
 
@@ -701,9 +701,9 @@ async def process_upload(client: Client, src, dst, cfg: dict):
 
     log.info(f"[{name}] Scanning (upload mode)...")
 
-    # 获取全部消息
+    # 获取消息（限 2000 条，避免无界全量拉取；标题合并需要向前找标题，故保留一定历史）
     all_msgs = []
-    async for msg in client.get_chat_history(src.id):
+    async for msg in client.get_chat_history(src.id, limit=2000):
         all_msgs.append(msg)
     all_msgs.reverse()
 
@@ -804,16 +804,19 @@ async def process_upload(client: Client, src, dst, cfg: dict):
             log.info(f"  Downloaded: {fsize / 1048576:.1f}MB")
 
             # === 上传115 ===
+            upload_ok = True  # 默认视为成功（未启用 115 时不影响流程）
             if p115_ready:
                 src_title = safe_filename(src.title if src.title else str(src.id), max_len=30)
                 now = fresh.date or datetime.now()
                 remote_dir = f"{src_title}/{now.year}-{now.month:02d}"
                 safe_name = safe_filename(cap) if cap else f"video_{msg.id}"
                 filename = f"{safe_name}.mp4"
-                await asyncio.wait_for(
+                upload_ok = await asyncio.wait_for(
                     asyncio.to_thread(upload_to_115, tmp_path, remote_dir, filename),
                     timeout=UPLOAD_TIMEOUT,
                 )
+                if not upload_ok:
+                    log.error(f"  [115] 上传失败(不推进进度，下次重试): {filename}")
 
             # === 上传到目标群 (TGdown) ===
             log.info(f"  Sending to destination...")
@@ -842,10 +845,17 @@ async def process_upload(client: Client, src, dst, cfg: dict):
                 if fid:
                     save_dedup_id(fid)
 
-            prog["done"] += 1
-            prog["last_id"] = msg.id
-            success = True
-            log.info(f"  OK")
+            if not upload_ok:
+                # 115 上传失败：不推进 last_id，下次循环重试（避免备份静默缺失）
+                prog["error"] += 1
+                prog["last_error"] = "115 upload failed"
+                success = False
+                log.error(f"  [115] 上传失败，跳过推进进度，下次重试")
+            else:
+                prog["done"] += 1
+                prog["last_id"] = msg.id
+                success = True
+                log.info(f"  OK")
 
         except FloodWait as e:
             wait = e.value + 5
@@ -857,12 +867,13 @@ async def process_upload(client: Client, src, dst, cfg: dict):
                 fresh = await client.get_messages(src.id, msg.id)
                 if fresh:
                     await client.download_media(fresh, file_name=tmp_path)
+                    upload_ok = True
                     if p115_ready:
                         src_title = safe_filename(src.title or str(src.id), max_len=30)
                         now = fresh.date or datetime.now()
                         remote_dir = f"{src_title}/{now.year}-{now.month:02d}"
                         safe_name = safe_filename(cap) if cap else f"video_{msg.id}"
-                        await asyncio.wait_for(
+                        upload_ok = await asyncio.wait_for(
                             asyncio.to_thread(upload_to_115, tmp_path, remote_dir, f"{safe_name}.mp4"),
                             timeout=UPLOAD_TIMEOUT,
                         )
@@ -873,10 +884,15 @@ async def process_upload(client: Client, src, dst, cfg: dict):
                                                 duration=fresh.video.duration)
                     else:
                         await client.send_document(dst.id, tmp_path, caption=cap)
-                    prog["done"] += 1
-                    prog["last_id"] = msg.id
-                    success = True
-                    log.info(f"  Retry OK")
+                    if not upload_ok:
+                        prog["error"] += 1
+                        prog["last_error"] = "115 upload failed (retry)"
+                        log.error(f"  Retry: 115 上传失败，不推进进度")
+                    else:
+                        prog["done"] += 1
+                        prog["last_id"] = msg.id
+                        success = True
+                        log.info(f"  Retry OK")
             except Exception as e2:
                 prog["error"] += 1
                 prog["last_error"] = str(e2)[:200]
@@ -1488,6 +1504,9 @@ async def mirror_destination(client: Client):
                         except Exception:
                             pass
             safe_name = safe_filename(caption) if caption else f"video_{msg.id}"
+            # 相册成员消息：标题合并后多条消息会共用同一 caption，附加 msg.id 兜底避免同名覆盖
+            if getattr(msg, "media_group_id", None):
+                safe_name = f"{safe_name}_{msg.id}"
             ext = ".jpg" if is_photo else ".mp4"
             now = msg.date or datetime.now()
             year_month = f"{now.year}_{now.month:02d}"
